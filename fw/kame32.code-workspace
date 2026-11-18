@@ -1,0 +1,114 @@
+{
+    "folders": [
+        {
+            "name": "fw",
+            "path": "."
+        },
+        {
+            "name": "hardware-doc",
+            "path": "../doc"
+        },
+        {
+            "path": "../app"
+        }
+    ],
+    "settings": {
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true,
+        "editor.detectIndentation": false,
+        "editor.rulers": [
+            80,
+            120
+        ],
+        "editor.cursorBlinking": "smooth",
+        "files.trimFinalNewlines": true,
+        "files.trimTrailingWhitespace": true,
+        "files.autoSave": "afterDelay",
+        "files.autoSaveDelay": 3000,
+        "editor.formatOnSave": false,
+        "editor.renderWhitespace": "all",
+        "cmake.configureOnOpen": false,
+        "terminal.integrated.cwd": "${workspaceFolder:fw}",
+        "C_Cpp.default.configurationProvider": "platformio.platformio-ide",
+        "files.watcherExclude": {
+            "**/.pio/**": true,
+            "**/.git/**": true,
+            "**/.history/**": true
+        },
+        "search.exclude": {
+            "**/.pio/**": true,
+            "**/.git/**": true,
+            "**/.history/**": true
+        }
+    },
+    "extensions": {
+        "recommendations": [
+            "platformio.platformio-ide"
+        ],
+        "unwantedRecommendations": [
+            "ms-vscode.cpptools-extension-pack",
+            "pioarduino.pioarduino-ide"
+        ]
+    },
+    "tasks": {
+        "version": "2.0.0",
+        "tasks": [
+            {
+                "label": "PlatformIO: Build",
+                "type": "process",
+                "command": "${env:HOME}/.platformio/penv/bin/pio",
+                "args": [
+                    "run"
+                ],
+                "options": {
+                    "cwd": "${workspaceFolder:fw}"
+                },
+                "problemMatcher": [
+                    "$gcc"
+                ],
+                "group": {
+                    "kind": "build",
+                    "isDefault": true
+                }
+            },
+            {
+                "label": "PlatformIO: Upload",
+                "type": "process",
+                "command": "${env:HOME}/.platformio/penv/bin/pio",
+                "args": [
+                    "run",
+                    "-t",
+                    "upload"
+                ],
+                "options": {
+                    "cwd": "${workspaceFolder:fw}"
+                },
+                "problemMatcher": [
+                    "$gcc"
+                ]
+            },
+            {
+                "label": "PlatformIO: Monitor",
+                "type": "process",
+                "command": "${env:HOME}/.platformio/penv/bin/pio",
+                "args": [
+                    "device",
+                    "monitor"
+                ],
+                "options": {
+                    "cwd": "${workspaceFolder:fw}"
+                },
+                "problemMatcher": []
+            },
+            {
+                "label": "Build and Flash",
+                "dependsOrder": "sequence",
+                "dependsOn": [
+                    "PlatformIO: Upload",
+                    "PlatformIO: Monitor"
+                ],
+                "problemMatcher": []
+            }
+        ]
+    }
+}

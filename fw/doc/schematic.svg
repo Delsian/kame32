@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1060" height="890" viewBox="0 0 1060 890"><rect width="1060" height="890" fill="#fff"/><g font-family="sans-serif" fill="#17283b"><text x="30" y="40" font-size="25">Kame32 — module wiring schematic</text>
+<rect x="30" y="90" width="230" height="260" rx="8" fill="#edf4fa" stroke="#395775"/>
+<text x="42" y="118" font-size="15" font-weight="bold">Waveshare ESP32-C6-Zero</text>
+<text x="42" y="148" font-size="14">USB powered</text>
+<text x="42" y="176" font-size="14">3V3 logic</text>
+<text x="42" y="204" font-size="14">GPIO0: SDA</text>
+<text x="42" y="232" font-size="14">GPIO1: SCL</text>
+<text x="42" y="260" font-size="14">GPIO2: OE</text>
+<text x="42" y="288" font-size="14">GND: common</text>
+<text x="42" y="316" font-size="14">GPIO3: battery ADC</text>
+<rect x="390" y="90" width="245" height="260" rx="8" fill="#edf4fa" stroke="#395775"/>
+<text x="402" y="118" font-size="17" font-weight="bold">PCA9685 · 0x40</text>
+<text x="402" y="148" font-size="14">VCC: 3V3</text>
+<text x="402" y="176" font-size="14">SDA / SCL: shared bus</text>
+<text x="402" y="204" font-size="14">OE: GPIO2 + 10k to 3V3</text>
+<text x="402" y="232" font-size="14">CH0–4, 12–14: servos</text>
+<text x="402" y="260" font-size="14">V+: external servo supply</text>
+<text x="402" y="288" font-size="14">GND: common</text>
+<rect x="30" y="430" width="230" height="150" rx="8" fill="#edf4fa" stroke="#395775"/>
+<text x="42" y="458" font-size="17" font-weight="bold">I2C display · 0x3C</text>
+<text x="42" y="488" font-size="14">0.91-inch SSD1306</text>
+<text x="42" y="516" font-size="14">128×32 OLED, 3V3</text>
+<text x="42" y="544" font-size="14">VCC / GND / SDA / SCL</text>
+<rect x="390" y="430" width="245" height="150" rx="8" fill="#edf4fa" stroke="#395775"/>
+<text x="402" y="458" font-size="17" font-weight="bold">VL53L0X · 0x29</text>
+<text x="402" y="488" font-size="14">3.3 V compatible breakout</text>
+<text x="402" y="516" font-size="14">VIN / GND / SDA / SCL</text>
+<text x="402" y="544" font-size="14">XSHUT high; INT unused</text>
+<rect x="770" y="90" width="235" height="150" rx="8" fill="#edf4fa" stroke="#395775"/>
+<text x="782" y="118" font-size="17" font-weight="bold">Eight servos</text>
+<text x="782" y="148" font-size="14">Signals: CH0–4, 12–14</text>
+<text x="782" y="176" font-size="14">Power: external V+</text>
+<text x="782" y="204" font-size="14">Return: common GND</text>
+<rect x="770" y="430" width="235" height="150" rx="8" fill="#edf4fa" stroke="#395775"/>
+<text x="782" y="458" font-size="17" font-weight="bold">Servo power supply</text>
+<text x="782" y="488" font-size="14">Voltage per servo spec</text>
+<text x="782" y="516" font-size="14">Size for total stall current</text>
+<text x="782" y="544" font-size="14">Fuse + bulk capacitor</text>
+<g fill="none" stroke="#326b9c" stroke-width="3"><path d="M260 200 H390"/><path d="M145 350 V430"/><path d="M145 390 H512 V430"/><path d="M635 200 H770"/><path d="M885 430 V240"/><path d="M770 510 H690 V320 H635"/></g><text x="275" y="185" font-size="14">I2C + OE</text><text x="650" y="185" font-size="11">0–4,12–14</text><text x="30" y="630" font-size="16">All grounds common. I2C pull-ups to 3V3. PCA VCC ≠ servo V+.</text><text x="30" y="660" font-size="16">See schematic.md for exact net mapping, OE pull-up and power notes.</text><rect x="30" y="700" width="975" height="155" rx="8" fill="#edf4fa" stroke="#395775"/>
+<text x="42" y="726" font-size="17" font-weight="bold">Battery sense · GPIO3 / ADC1_CH3 · 2S Li-ion/LiPo · 8.4 V full</text>
+<text x="42" y="755" font-size="16">Battery + → 100 kΩ → GPIO3 → 22 kΩ → common GND / Battery −</text>
+<text x="42" y="783" font-size="16">100 nF: GPIO3 to GND, near ESP32. Divider resistors: 1%.</text>
+<text x="42" y="811" font-size="16">8.4 V battery → 1.515 V ADC. Never connect battery directly to GPIO3.</text>
+<text x="42" y="839" font-size="16">Disconnect sense when ESP32 is off. Confirm pack voltage and divider before wiring.</text>
+</g></svg>
