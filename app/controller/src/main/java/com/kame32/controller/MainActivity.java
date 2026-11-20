@@ -9,6 +9,7 @@ import android.content.pm.PackageManager;
 import android.os.*;
 import android.graphics.Color;
 import android.net.Uri;
+import android.text.InputType;
 import android.view.*;
 import android.widget.*;
 import java.io.ByteArrayOutputStream;
@@ -24,12 +25,14 @@ public class MainActivity extends Activity {
     private static final UUID SERVICE = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e");
     private static final UUID POSE = UUID.fromString("6e400004-b5a3-f393-e0a9-e50e24dcca9e");
     private static final UUID OTA = UUID.fromString("6e400005-b5a3-f393-e0a9-e50e24dcca9e");
+    private static final UUID WIFI = UUID.fromString("6e400006-b5a3-f393-e0a9-e50e24dcca9e");
     private static final UUID TX = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e");
     private static final UUID CCC = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
     private final Handler handler = new Handler(Looper.getMainLooper());
     private static final int[] SERVO_CHANNELS = {0, 1, 2, 3, 4, 12, 13, 14};
-    private static final int MIN_PULSE = 1000;
-    private static final int PULSE_SPAN = 1000;
+    private static final int MIN_PULSE = 500;
+    private static final int MAX_PULSE = 2500;
+    private static final int PULSE_SPAN = MAX_PULSE - MIN_PULSE;
     private static final int POSITION_STEPS = 254;
     private final byte[] positions = new byte[8];
     private final ArrayList<GestureStep> gesture = new ArrayList<>();
@@ -53,6 +56,12 @@ public class MainActivity extends Activity {
     private BluetoothLeScanner scanner;
     private BluetoothGatt gatt;
     private BluetoothGattCharacteristic poseCharacteristic;
+    private BluetoothGattCharacteristic wifiCharacteristic;
+    private final ArrayDeque<byte[]> wifiPackets = new ArrayDeque<>();
+    private boolean writingWifi;
+    private Button wifiSetup, wifiRefresh, wifiOpen;
+    private TextView wifiStatus;
+    private Uri wifiPage;
     private boolean ready, busy, scanning, holding;
     private TextView status, response;
     private LinearLayout devices;
@@ -62,7 +71,7 @@ public class MainActivity extends Activity {
     private final Runnable nextGestureStep = this::advanceGesture;
     private final Set<String> found = new HashSet<>();
     private static final int PICK_FIRMWARE = 2;
-    private static final int MAX_FIRMWARE_SIZE = 0x140000;
+    private static final int MAX_FIRMWARE_SIZE = 0x1e0000;
     private static final int OTA_MTU = 247;
     private enum OtaPhase { IDLE, WAITING, MTU, BEGIN, DATA, END }
     private OtaPhase otaPhase = OtaPhase.IDLE;
@@ -122,7 +131,18 @@ public class MainActivity extends Activity {
         content.addView(chooseFirmware);
         content.addView(firmwareSelection);
         content.addView(installFirmware);
-        content.addView(label("Pulse width • 1000–2000 µs\nReleasing a slider sends all eight displayed positions.",14));
+        wifiSetup = button("Wi-Fi settings", this::showWifiSettings);
+        wifiRefresh = button("Check Wi-Fi status", () -> queueWifi(new byte[]{0}));
+        wifiOpen = button("Open servo web page", () -> {
+            if (wifiPage != null) startActivity(new Intent(Intent.ACTION_VIEW, wifiPage));
+        });
+        wifiStatus = label("Connect over BLE to set up Wi-Fi", 14);
+        content.addView(wifiSetup);
+        content.addView(wifiRefresh);
+        content.addView(wifiOpen);
+        content.addView(wifiStatus);
+        content.addView(label("Pulse width • " + MIN_PULSE + "–" + MAX_PULSE
+                + " µs\nMoving a slider sends all eight displayed positions.", 14));
         Button apply = button("Apply all 8 servos", this::applyPose);
         controls.add(apply); content.addView(apply);
         Button center = button("Set all to 1500 µs", () -> {
@@ -140,9 +160,10 @@ public class MainActivity extends Activity {
                     positions[channel] = (byte) (p + 1);
                     int pulse = MIN_PULSE + (p * PULSE_SPAN + POSITION_STEPS / 2) / POSITION_STEPS;
                     value.setText("Channel " + SERVO_CHANNELS[channel] + "   •   " + pulse + " µs");
+                    if (user) applyPose();
                 }
                 public void onStartTrackingTouch(SeekBar s) {}
-                public void onStopTrackingTouch(SeekBar s) { applyPose(); }
+                public void onStopTrackingTouch(SeekBar s) {}
             });
         }
         addGestureControls(content);
@@ -236,6 +257,71 @@ public class MainActivity extends Activity {
         for (View view : controls) view.setEnabled(enabled);
         updateGestureControls();
         updateFirmwareControls();
+        updateWifiControls();
+    }
+
+    private void updateWifiControls() {
+        boolean available = ready && wifiCharacteristic != null && otaPhase == OtaPhase.IDLE;
+        wifiSetup.setEnabled(available && !writingWifi && wifiPackets.isEmpty());
+        wifiRefresh.setEnabled(wifiSetup.isEnabled());
+        wifiOpen.setEnabled(available && wifiPage != null);
+    }
+
+    private void showWifiSettings() {
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setPadding(24, 0, 24, 0);
+        EditText ssid = new EditText(this);
+        ssid.setHint("Wi-Fi network name");
+        ssid.setSingleLine();
+        EditText password = new EditText(this);
+        password.setHint("Password (blank for open networks)");
+        password.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        form.addView(ssid);
+        form.addView(password);
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("Wi-Fi settings")
+                .setView(form).setNegativeButton("Cancel", null).setPositiveButton("Save and connect", null).create();
+        dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+            String networkName = ssid.getText().toString();
+            byte[] name = networkName.getBytes(StandardCharsets.UTF_8);
+            String keyText = password.getText().toString();
+            if (name.length == 0 || name.length > 32 || networkName.chars().anyMatch(c -> c < 32 || c == 127)) {
+                ssid.setError("Enter a network name of 1–32 bytes");
+                return;
+            }
+            if ((!keyText.isEmpty() && keyText.length() < 8) || keyText.length() > 63
+                    || keyText.chars().anyMatch(c -> c < 32 || c > 126)) {
+                password.setError("Use 8–63 printable ASCII characters, or leave blank for an open network");
+                return;
+            }
+            if (!wifiSetup.isEnabled()) return;
+            byte[] key = keyText.getBytes(StandardCharsets.US_ASCII);
+            byte[] credentials = Arrays.copyOf(name, name.length + key.length);
+            System.arraycopy(key, 0, credentials, name.length, key.length);
+            wifiPackets.add(new byte[]{1, (byte) name.length, (byte) key.length});
+            for (int offset = 0; offset < credentials.length; offset += 19) {
+                int size = Math.min(19, credentials.length - offset);
+                byte[] packet = new byte[size + 1];
+                packet[0] = 2;
+                System.arraycopy(credentials, offset, packet, 1, size);
+                wifiPackets.add(packet);
+            }
+            wifiPage = null;
+            wifiStatus.setText("Sending Wi-Fi settings • accept Bluetooth pairing if prompted");
+            password.setText("");
+            updateWifiControls();
+            pump();
+            dialog.dismiss();
+        }));
+        dialog.show();
+    }
+
+    private void queueWifi(byte[] packet) {
+        if (!wifiRefresh.isEnabled()) return;
+        wifiPackets.add(packet);
+        wifiStatus.setText("Checking Wi-Fi • accept Bluetooth pairing if prompted");
+        updateWifiControls();
+        pump();
     }
 
     private void updateFirmwareControls() {
@@ -286,7 +372,8 @@ public class MainActivity extends Activity {
         if (isDestroyed()) return;
         firmware = image;
         loadingFirmware = false;
-        firmwareSelection.setText(image == null ? "Choose a valid Kame32 firmware.bin (up to 1280 KiB)"
+        firmwareSelection.setText(image == null ? "Choose a valid Kame32 firmware.bin (up to "
+                + (MAX_FIRMWARE_SIZE / 1024) + " KiB)"
                 : "Firmware selected • " + image.length + " bytes");
         updateFirmwareControls();
     }
@@ -303,6 +390,7 @@ public class MainActivity extends Activity {
     private void startFirmwareUpdate() {
         if (!ready || otaCharacteristic == null || firmware == null || otaPhase != OtaPhase.IDLE) return;
         otaPhase = OtaPhase.WAITING;
+        wifiPackets.clear();
         handler.removeCallbacks(heartbeat);
         cancelGesture();
         pendingPose = heldPose = null;
@@ -415,7 +503,7 @@ public class MainActivity extends Activity {
     }
     private void watchdog() {
         handler.removeCallbacks(timeout);
-        handler.postDelayed(timeout, otaPhase == OtaPhase.IDLE ? 5000 : 15000);
+        handler.postDelayed(timeout, writingWifi ? 30000 : otaPhase == OtaPhase.IDLE ? 5000 : 15000);
     }
     private void updatePwmButton() {
         pwmToggle.setText(holding ? "PWM ON • turn OFF" : "PWM OFF • turn ON");
@@ -443,13 +531,18 @@ public class MainActivity extends Activity {
 
     private void pump() {
         if (busy || !ready || (otaPhase != OtaPhase.IDLE && otaPhase != OtaPhase.WAITING)) return;
-        if (otaPhase == OtaPhase.IDLE && !stopPending && pendingPose == null) return;
+        if (otaPhase == OtaPhase.IDLE && !stopPending && pendingPose == null && wifiPackets.isEmpty()) return;
         if (Build.VERSION.SDK_INT >= 31 && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
             disconnect("Bluetooth permission revoked");
             return;
         }
         if (otaPhase == OtaPhase.WAITING) {
             requestOtaMtu();
+            return;
+        }
+        if (!stopPending && !wifiPackets.isEmpty()) {
+            writingWifi = true;
+            writeBle(wifiCharacteristic, wifiPackets.remove());
             return;
         }
 
@@ -486,6 +579,13 @@ public class MainActivity extends Activity {
     }
     private void notification(BluetoothGatt source,byte[] value) { String text=new String(value,StandardCharsets.US_ASCII);handler.post(() -> {
         if(source!=gatt)return;
+        if (text.startsWith("WF ") || text.startsWith("IP ")) {
+            wifiPage = text.startsWith("IP ") && text.substring(3).matches("[0-9.]+")
+                    ? Uri.parse("http://" + text.substring(3) + "/") : null;
+            wifiStatus.setText(wifiPage == null ? "Wi-Fi • " + text.substring(3) : wifiPage.toString());
+            updateWifiControls();
+            return;
+        }
         if (otaPhase != OtaPhase.IDLE && (text.startsWith("OTA ") || text.startsWith("STOP"))) {
             otaNotification(text);
             return;
@@ -514,6 +614,7 @@ public class MainActivity extends Activity {
             BluetoothGattCharacteristic tx=service==null?null:service.getCharacteristic(TX);
             poseCharacteristic = service == null ? null : service.getCharacteristic(POSE);
             otaCharacteristic = service == null ? null : service.getCharacteristic(OTA);
+            wifiCharacteristic = service == null ? null : service.getCharacteristic(WIFI);
             BluetoothGattDescriptor descriptor=tx==null?null:tx.getDescriptor(CCC);
             if(code!=0 || poseCharacteristic==null || descriptor==null || !g.setCharacteristicNotification(tx,true)) { disconnect("Kame32 pose service unavailable • update firmware");return; }
             boolean accepted;
@@ -527,6 +628,7 @@ public class MainActivity extends Activity {
         
             if(code!=0) { disconnect("Notification subscription failed");return; }
             handler.removeCallbacks(timeout);ready=true;enable(true);status.setText("Connected • no pose applied");
+            wifiStatus.setText(wifiCharacteristic == null ? "Update ESP32 firmware for Wi-Fi settings" : "Set up Wi-Fi or check its status");
             releaseOutputs();handler.postDelayed(heartbeat,500);
         }); }
         @Override public void onMtuChanged(BluetoothGatt g, int mtu, int code) { handler.post(() -> {
@@ -537,6 +639,17 @@ public class MainActivity extends Activity {
             if (Build.VERSION.SDK_INT >= 31 && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) { disconnect("Bluetooth permission revoked"); return; }
         
             busy = false;
+            if (WIFI.equals(c.getUuid())) {
+                writingWifi = false;
+                handler.removeCallbacks(timeout);
+                if (code != BluetoothGatt.GATT_SUCCESS) {
+                    wifiPackets.clear();
+                    wifiStatus.setText("Wi-Fi Bluetooth write failed • check pairing and retry");
+                }
+                updateWifiControls();
+                pump();
+                return;
+            }
             if (code != 0) { disconnect("Command failed; outputs released"); return; }
             if (OTA.equals(c.getUuid())) {
                 advanceOta();
@@ -554,6 +667,11 @@ public class MainActivity extends Activity {
         stopScan();handler.removeCallbacks(timeout);handler.removeCallbacks(heartbeat);
         otaPhase = OtaPhase.IDLE;
         otaCharacteristic = null;
+        wifiCharacteristic = null;
+        wifiPackets.clear();
+        writingWifi = false;
+        wifiPage = null;
+        if (wifiStatus != null) wifiStatus.setText("Connect over BLE to set up Wi-Fi");
         ready=false;busy=false;holding=false;stopPending=false;
         cancelGesture();updatePwmButton();heldPose=pendingPose=null;poseCharacteristic=null;enable(false);
         BluetoothGatt old=gatt;gatt=null;

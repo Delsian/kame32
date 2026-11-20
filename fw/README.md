@@ -23,6 +23,30 @@ SDA is GPIO0, SCL is GPIO1 and PCA9685 OE is GPIO2.
 Pins, addresses, servo limits and timeout are in
 `include/config.h`. Wiring is in [doc/schematic.md](doc/schematic.md).
 
+Build with `pio run -e waveshare-esp32-c6-zero-pwm-debug` to start PWM at
+1500 µs on all eight channels and hold the current pose through BLE idle and
+disconnect. STOP, including the Android app's initial STOP on connection,
+releases the outputs until a new pose or SET command. Firmware updates and
+receive faults also release the outputs.
+
+## Wi-Fi servo controls
+
+Connect to Kame32 in the Android app over BLE and open **Wi-Fi settings**.
+Enter the name and password of your 2.4 GHz Wi-Fi network, then tap **Save and
+connect**. Accept the Android Bluetooth pairing prompt if it appears. The
+ESP32 stores the credentials in nonvolatile flash and reconnects after a reboot.
+Leave the password blank for an open network.
+
+Once the ESP32 joins, the app shows its local address and enables **Open servo
+web page**. Use **Check Wi-Fi status** after reconnecting over BLE. The page
+has eight sliders and a STOP button. Use it on a trusted local network, where
+devices that can reach the ESP32 can use the servo controls.
+
+Keep the page visible to hold the outputs with the standard firmware. They
+release after two seconds without a keepalive. The PWM debug profile holds
+the last pulse widths until STOP. BLE and Wi-Fi share the same outputs, so
+use one controller at a time.
+
 ## Startup RGB LED
 
 The onboard RGB LED (GPIO8) shows dim blue during initialization. Once BLE
@@ -42,8 +66,9 @@ driver at **0x3C**. Set `DisplayEnabled = false` to omit the screen.
 A missing display does not block BLE/servo operation. Two four-line pages
 alternate every three seconds: BLE connection and battery voltage, PCA presence
 and output state, distance, and the first 21 characters of the last response;
-then all eight channel pulse widths. Full responses remain available over BLE
-and Serial.
+then all eight channel pulse widths. When PWM values change, the next OLED
+refresh shows the pulse widths and keeps that page visible for three seconds
+after the last change. Full responses remain available over BLE and Serial.
 
 ## Distance sensor
 
@@ -108,7 +133,7 @@ any nearby client can connect and command the servos. No Bluetooth Classic/SPP.
 | `BATTERY` | Read cached voltage: `OK BATTERY <n> mV`; ERR if disabled or unavailable; does not refresh servo timeout |
 | `STOP` | Disable all outputs immediately when processed |
 
-Commands use physical PCA9685 channels 0–4 and 12–14; accepted pulse widths are 1000–2000 µs at 50 Hz. Calibrate
+Commands use physical PCA9685 channels 0–4 and 12–14; accepted pulse widths are 500–2500 µs at 50 Hz. Calibrate
 limits to the servos/linkage before expanding them. Send Pose, SET or PING more
 often than every two seconds while holding a pose. Boot, disconnect, timeout,
 queue overflow and malformed BLE frames disable outputs. Invalid text commands
@@ -122,7 +147,9 @@ single channel. Channels 5–11 and 15 remain off.
 Flash an OTA-capable build over USB once with `pio run -t upload`. For later
 updates, build with `pio run` and select
 `.pio/build/waveshare-esp32-c6-zero/firmware.bin` in the Android controller.
-The default 4 MB partition table has two 1280 KiB app slots.
+The 4 MB partition table has two 1920 KiB app slots. Install the Wi-Fi build
+over USB once to write the larger partition table, then use an updated Android
+app for later BLE firmware updates.
 
 Connect to Kame32, tap **Install firmware over BLE**, and hold the onboard
 **BOOT** button while confirming **Install**. Release BOOT when the transfer

@@ -15,7 +15,7 @@ APK: `controller/build/outputs/apk/debug/controller-debug.apk`.
 1. Power the robot and enable Bluetooth on the phone.
 2. Tap **Scan for Kame32**, grant Nearby Devices permission (location permission
    and enabled system Location on Android 8–11), then select the robot's address.
-3. Release a slider or tap **Apply all 8 servos** to send all eight displayed positions.
+3. Move a slider or tap **Apply all 8 servos** to send all eight displayed positions.
    The slider values are requested values, not measured servo positions.
 4. **Set all to 1500 µs** moves all eight channels to their midpoint.
 5. **PWM OFF • turn ON** applies all eight displayed values and keeps them active.
@@ -38,7 +38,7 @@ In the app, tap **Choose firmware file** and select the Kame32
 the foreground until Kame32 restarts, then scan and reconnect. **Cancel update**
 disconnects and aborts an unfinished transfer.
 
-Physical PCA9685 channels 0–4 and 12–14 use the firmware's 1000–2000 µs range.
+Physical PCA9685 channels 0–4 and 12–14 use the firmware's 500–2500 µs range.
 The app sends one eight-byte BLE write with response per pose and refreshes the
 active pose every 500 ms. Connection setup and writes
 have a five-second watchdog. Firmware independently releases outputs after two
@@ -50,3 +50,10 @@ Before testing with attached linkage, verify each servo's usable pulse range.
 On real hardware, check all eight channels, a gesture with different hold times, Stop during playback, Bluetooth loss,
 permission denial, and leaving/returning to the app. Verify firmware timeout by
 interrupting app communication. Compilation cannot validate radio or servo motion.
+
+## Wi-Fi setup
+
+Connect over BLE, tap **Wi-Fi settings**, and enter the name and password of
+your 2.4 GHz Wi-Fi network. Tap **Save and connect** and accept Bluetooth
+pairing if prompted. When the ESP32 joins, tap **Open servo web page**.
+Use **Check Wi-Fi status** to retrieve its address after reconnecting.

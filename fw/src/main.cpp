@@ -1,5 +1,8 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
 #include <Adafruit_PWMServoDriver.h>
 #include <Adafruit_SSD1306.h>
 #include <NimBLEDevice.h>
@@ -7,6 +10,7 @@
 #include <esp_ota_ops.h>
 #include <atomic>
 #include "config.h"
+#include "servo_page.h"
 
 // BLE callbacks only enqueue data; loop owns I2C, PWM and status notifications.
 static_assert(config::ServoCount == 8, "The BLE pose format requires eight servos");
@@ -18,6 +22,15 @@ struct Command {
     };
 };
 QueueHandle_t commands;
+enum class WebAction : uint8_t { Set, Stop, Hold };
+struct WebCommand {
+    WebAction action;
+    uint8_t channel = 0;
+    uint16_t pulse = 0;
+};
+QueueHandle_t webCommands;
+bool webHolding = false;
+std::atomic<bool> webControlAvailable{false};
 constexpr uint16_t OtaMtu = 247;
 constexpr uint32_t OtaTimeoutMs = 15000;
 struct OtaPacket {
@@ -30,7 +43,14 @@ esp_ota_handle_t otaHandle;
 uint32_t otaRemaining, otaLastPacket, otaFinishedAt;
 bool otaRebootPending = false;
 std::atomic<bool> connected{false};
+std::atomic<uint32_t> bleSession{0};
 std::atomic<bool> stopRequested{false};
+std::atomic<bool> disconnected{false};
+#ifdef KAME32_DEBUG_HOLD_PWM
+constexpr bool debugHoldPwm = true;
+#else
+constexpr bool debugHoldPwm = false;
+#endif
 Adafruit_PWMServoDriver pwm(config::PcaAddress);
 Adafruit_SSD1306 display(128, 32, &Wire, -1);
 Adafruit_VL53L0X rangeSensor;
@@ -42,6 +62,7 @@ bool batteryValid = false;
 NimBLECharacteristic *tx;
 bool pcaReady = false, displayReady = false, active = false;
 uint16_t pulses[16] = {};
+bool pulsesChanged = false;
 uint32_t lastCommand = 0;
 bool startupLedPending = false;
 uint32_t startupLedSince = 0;
@@ -53,9 +74,11 @@ char lastStatus[64] = "BOOT";
 
 void stopOutputs() {
     digitalWrite(config::OutputEnable, HIGH);
+    webHolding = false;
     if (pcaReady) {
         for (uint8_t i = 0; i < 16; ++i) pwm.setPWM(i, 0, 4096);
     }
+    pulsesChanged |= active;
     memset(pulses, 0, sizeof(pulses));
     active = false;
 }
@@ -91,8 +114,10 @@ void processOta(const OtaPacket &packet) {
         const uint32_t size = uint32_t(bytes[1]) | (uint32_t(bytes[2]) << 8) |
                               (uint32_t(bytes[3]) << 16) | (uint32_t(bytes[4]) << 24);
         const esp_partition_t *target = esp_ota_get_next_update_partition(nullptr);
+        webControlAvailable = false;
         stopOutputs();
         xQueueReset(commands);
+        if (webCommands) xQueueReset(webCommands);
         if (!target || size == 0 || size > target->size ||
             esp_ota_begin(target, OTA_WITH_SEQUENTIAL_WRITES, &otaHandle) != ESP_OK) {
             failOta("OTA ERR BEGIN");
@@ -132,10 +157,15 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         connected = true;
     }
     void onDisconnect(NimBLEServer *, NimBLEConnInfo &, int) override {
+        ++bleSession;
         connected = false;
-        stopRequested = true;
-        // Disable immediately, even if loop is currently updating the display.
-        digitalWrite(config::OutputEnable, HIGH);
+        if (debugHoldPwm) {
+            disconnected = true;
+        } else {
+            stopRequested = true;
+            // Disable immediately, even if loop is currently updating the display.
+            digitalWrite(config::OutputEnable, HIGH);
+        }
         NimBLEDevice::startAdvertising();
     }
 };
@@ -235,14 +265,18 @@ bool writeServo(uint8_t channel, uint16_t pulse) {
         reply("ERR I2C write");
         return false;
     }
+    pulsesChanged |= pulses[channel] != pulse;
     pulses[channel] = pulse;
     return true;
 }
 
-void enableOutputs() {
+void enableOutputs(bool fromWeb = false) {
     lastCommand = millis();
     active = true;
-    if (connected.load() && !stopRequested.load()) digitalWrite(config::OutputEnable, LOW);
+    webHolding = fromWeb;
+    if ((fromWeb || debugHoldPwm || connected.load()) && !stopRequested.load()) {
+        digitalWrite(config::OutputEnable, LOW);
+    }
 }
 
 void processPose(const uint8_t *pose) {
@@ -273,7 +307,7 @@ void processCommand(const char *text) {
         stopOutputs();
         reply("OK STOP");
     } else if (strcmp(text, "PING") == 0 || strcmp(text, "PING\n") == 0) {
-        lastCommand = millis();
+        if (!webHolding) lastCommand = millis();
         reply("OK PONG");
     } else if (strcmp(text, "RANGE") == 0 || strcmp(text, "RANGE\n") == 0) {
         if (!config::RangeEnabled) reply("ERR VL53L0X disabled");
@@ -302,6 +336,179 @@ void processCommand(const char *text) {
         }
     } else {
         reply("ERR use SET ch us / STOP / PING / RANGE / BATTERY");
+    }
+}
+
+struct WifiSettings {
+    char ssid[33];
+    char password[64];
+};
+
+bool validWifiSettings(const WifiSettings &settings) {
+    const size_t ssidSize = strnlen(settings.ssid, sizeof(settings.ssid));
+    const size_t keySize = strnlen(settings.password, sizeof(settings.password));
+    if (ssidSize == 0 || ssidSize >= sizeof(settings.ssid) || (keySize != 0 && keySize < 8) ||
+        keySize >= sizeof(settings.password)) return false;
+    for (size_t i = 0; i < ssidSize; ++i) {
+        const auto ch = static_cast<uint8_t>(settings.ssid[i]);
+        if (ch < 32 || ch == 127) return false;
+    }
+    for (size_t i = 0; i < keySize; ++i) {
+        const auto ch = static_cast<uint8_t>(settings.password[i]);
+        if (ch < 32 || ch > 126) return false;
+    }
+    return true;
+}
+
+struct WifiRequest {
+    WifiSettings settings{};
+    bool save = false;
+    uint32_t session = 0;
+};
+QueueHandle_t wifiRequests;
+
+void wifiReply(const char *message, uint32_t session) {
+    if (connected.load() && bleSession.load() == session) {
+        tx->notify(reinterpret_cast<const uint8_t *>(message), strlen(message));
+    }
+}
+
+class WifiCallbacks : public NimBLECharacteristicCallbacks {
+    uint8_t bytes[95]{};
+    size_t used = 0, ssidSize = 0, keySize = 0;
+    uint32_t session = 0;
+
+    void onWrite(NimBLECharacteristic *characteristic, NimBLEConnInfo &) override {
+        const std::string packet = characteristic->getValue();
+        const auto currentSession = bleSession.load();
+        if (packet.size() == 1 && packet[0] == 0) {
+            const WifiRequest request{{}, false, currentSession};
+            if (xQueueSend(wifiRequests, &request, 0) != pdTRUE) wifiReply("WF Busy", currentSession);
+            return;
+        }
+        if (packet.size() == 3 && packet[0] == 1) {
+            used = 0;
+            ssidSize = static_cast<uint8_t>(packet[1]);
+            keySize = static_cast<uint8_t>(packet[2]);
+            session = currentSession;
+            if (ssidSize >= 1 && ssidSize <= 32 && keySize <= 63) return;
+        } else if (packet.size() >= 2 && packet.size() <= 20 && packet[0] == 2 &&
+                   session == currentSession && ssidSize && used + packet.size() - 1 <= ssidSize + keySize) {
+            memcpy(bytes + used, packet.data() + 1, packet.size() - 1);
+            used += packet.size() - 1;
+            if (used < ssidSize + keySize) return;
+            WifiRequest request{{}, true, currentSession};
+            memcpy(request.settings.ssid, bytes, ssidSize);
+            memcpy(request.settings.password, bytes + ssidSize, keySize);
+            ssidSize = 0;
+            if (!memchr(bytes, 0, used) && validWifiSettings(request.settings)) {
+                if (xQueueSend(wifiRequests, &request, 0) != pdTRUE) wifiReply("WF Busy", currentSession);
+                return;
+            }
+        }
+        ssidSize = 0;
+        wifiReply("WF Invalid settings", currentSession);
+    }
+};
+
+void serveWifi(void *) {
+    Preferences preferences;
+    const bool canSave = preferences.begin("wifi-sta", false);
+    WifiSettings saved{};
+    bool configured = canSave && preferences.getBytesLength("settings-v1") == sizeof(saved) &&
+        preferences.getBytes("settings-v1", &saved, sizeof(saved)) == sizeof(saved) && validWifiSettings(saved);
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    if (configured) WiFi.begin(saved.ssid, saved.password);
+    String page(ServoPageStart);
+    const unsigned center = (config::MinPulseUs + config::MaxPulseUs) / 2;
+    for (const unsigned channel : config::ServoChannels) {
+        char slider[256];
+        snprintf(slider, sizeof(slider),
+                 "<label>Channel %u <output>%u µs</output>"
+                 "<input type=range aria-label='Channel %u pulse width' data-channel=%u "
+                 "min=%u max=%u value=%u></label>",
+                 channel, center, channel, channel, config::MinPulseUs, config::MaxPulseUs, center);
+        page += slider;
+    }
+    page += ServoPageEnd;
+
+    WebServer server(80);
+    server.on("/", HTTP_GET, [&] { server.send(200, "text/html; charset=utf-8", page); });
+    const auto submit = [&](WebCommand command) {
+        if (server.header("X-Kame32-Control") != "1") {
+            server.send(403);
+        } else if (!webControlAvailable.load()) {
+            server.send(503);
+        } else if (xQueueSend(webCommands, &command, 0) == pdTRUE) {
+            server.send(202);
+        } else {
+            server.send(503);
+        }
+    };
+    const char *headers[] = {"X-Kame32-Control"};
+    server.collectHeaders(headers, 1);
+    server.on("/servo", HTTP_POST, [&] {
+        const String body = server.arg("plain");
+        unsigned channel, pulse;
+        char extra;
+        if (sscanf(body.c_str(), "%3u %4u %c", &channel, &pulse, &extra) != 2 ||
+            !config::isServoChannel(channel) || pulse < config::MinPulseUs || pulse > config::MaxPulseUs) {
+            server.send(400);
+            return;
+        }
+        submit({WebAction::Set, static_cast<uint8_t>(channel), static_cast<uint16_t>(pulse)});
+    });
+    server.on("/stop", HTTP_POST, [&] { submit({WebAction::Stop}); });
+    server.on("/hold", HTTP_POST, [&] { submit({WebAction::Hold}); });
+    IPAddress lastIp;
+    uint32_t reportingSession = 0;
+    uint32_t joiningSince = millis();
+    bool reportJoin = false;
+    for (;;) {
+        WifiRequest request;
+        if (xQueueReceive(wifiRequests, &request, 0) == pdTRUE) {
+            if (request.save) {
+                if (!canSave || preferences.putBytes("settings-v1", &request.settings, sizeof(saved)) != sizeof(saved)) {
+                    wifiReply("WF Save failed", request.session);
+                } else {
+                    saved = request.settings;
+                    configured = true;
+                    WiFi.disconnect(false, false, 1000);
+                    WiFi.begin(saved.ssid, saved.password);
+                    joiningSince = millis();
+                    reportingSession = request.session;
+                    reportJoin = true;
+                    wifiReply("WF Saved, joining", request.session);
+                }
+            } else if (WiFi.status() == WL_CONNECTED) {
+                wifiReply((String("IP ") + WiFi.localIP().toString()).c_str(), request.session);
+            } else {
+                wifiReply(configured ? "WF Not connected" : "WF Setup required", request.session);
+                reportingSession = request.session;
+                joiningSince = millis();
+                reportJoin = configured;
+            }
+        }
+        const IPAddress ip = WiFi.status() == WL_CONNECTED ? WiFi.localIP() : IPAddress();
+        if (ip != lastIp) {
+            if (lastIp != IPAddress()) server.stop();
+            if (ip != IPAddress()) {
+                server.begin();
+                Serial.printf("Wi-Fi servo control: http://%s/\n", ip.toString().c_str());
+            }
+            lastIp = ip;
+        }
+        if (reportJoin && ip != IPAddress()) {
+            wifiReply((String("IP ") + ip.toString()).c_str(), reportingSession);
+            reportJoin = false;
+        } else if (reportJoin && millis() - joiningSince >= 20000) {
+            wifiReply("WF Join timed out", reportingSession);
+            reportJoin = false;
+        }
+        if (ip != IPAddress()) server.handleClient();
+        vTaskDelay(1);
     }
 }
 
@@ -345,6 +552,7 @@ void setup() {
     }
     NimBLEDevice::init(config::DeviceName);
     NimBLEDevice::setMTU(OtaMtu);
+    NimBLEDevice::setSecurityAuth(true, false, true);
     auto server = NimBLEDevice::createServer();
     server->setCallbacks(new ServerCallbacks());
     auto service = server->createService(config::ServiceUuid);
@@ -356,6 +564,17 @@ void setup() {
     ota->setCallbacks(new OtaCallbacks());
     tx = service->createCharacteristic(config::TxUuid, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
     tx->setValue(pcaReady ? "READY" : "ERR PCA9685 missing");
+    if (debugHoldPwm && pcaReady) {
+        uint8_t centeredPose[config::ServoCount];
+        memset(centeredPose, 128, sizeof(centeredPose));
+        processPose(centeredPose);
+    }
+    wifiRequests = xQueueCreate(2, sizeof(WifiRequest));
+    if (wifiRequests) {
+        auto wifi = service->createCharacteristic(config::WifiUuid,
+            NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC, 20);
+        wifi->setCallbacks(new WifiCallbacks());
+    }
     service->start();
     auto advertising = NimBLEDevice::getAdvertising();
     advertising->addServiceUUID(config::ServiceUuid);
@@ -372,6 +591,11 @@ void setup() {
         startupLedSince = millis();
         startupLedPending = true;
     }
+    webCommands = xQueueCreate(8, sizeof(WebCommand));
+    webControlAvailable = pcaReady;
+    if (!webCommands || !wifiRequests || xTaskCreate(serveWifi, "servo-wifi", 8192, nullptr, 1, nullptr) != pdPASS) {
+        Serial.println("ERR Wi-Fi worker");
+    }
 }
 
 void loop() {
@@ -384,12 +608,16 @@ void loop() {
         startupLed(0, 0, 0);
         startupLedPending = false;
     }
-    if (stopRequested.exchange(false)) {
+    const bool linkLost = disconnected.exchange(false);
+    const bool rxFault = stopRequested.exchange(false);
+    if (linkLost || rxFault) {
         xQueueReset(commands);
         xQueueReset(otaPackets);
         abortOta();
-        stopOutputs();
-        reply("STOP disconnect or RX fault");
+        if (rxFault) {
+            stopOutputs();
+            reply("STOP disconnect or RX fault");
+        }
     }
     OtaPacket otaPacket;
     if (xQueueReceive(otaPackets, &otaPacket, 0) == pdTRUE && connected.load() && !stopRequested.load()) {
@@ -398,10 +626,12 @@ void loop() {
     if (otaRebootPending) return;
     if (otaPartition) {
         xQueueReset(commands);
+        if (webCommands) xQueueReset(webCommands);
         if (millis() - otaLastPacket > OtaTimeoutMs) failOta("OTA ERR TIMEOUT");
         delay(1);
         return;
     }
+    webControlAvailable = pcaReady;
     updateRange();
     updateBattery();
     Command command{};
@@ -409,18 +639,39 @@ void loop() {
         if (command.isPose) processPose(command.pose);
         else processCommand(command.text);
     }
-    if (active && (!connected.load() || millis() - lastCommand > config::TimeoutMs)) {
+    WebCommand webCommand;
+    if (webCommands && !stopRequested.load() && xQueueReceive(webCommands, &webCommand, 0) == pdTRUE) {
+        switch (webCommand.action) {
+            case WebAction::Set:
+                if (pcaReady && writeServo(webCommand.channel, webCommand.pulse)) enableOutputs(true);
+                break;
+            case WebAction::Stop:
+                stopOutputs();
+                break;
+            case WebAction::Hold:
+                if (webHolding) lastCommand = millis();
+                break;
+        }
+    }
+    if (!debugHoldPwm && active && ((!webHolding && !connected.load()) ||
+                                   millis() - lastCommand > config::TimeoutMs)) {
         stopOutputs();
         reply("STOP timeout/disconnect");
     }
     static uint32_t lastDisplay = 0;
+    static uint32_t displayCycleStart = 0;
     if (displayReady && millis() - lastDisplay >= 250) {
         lastDisplay = millis();
+        constexpr uint32_t pageDurationMs = 3000;
+        if (pulsesChanged) {
+            displayCycleStart = lastDisplay - pageDurationMs;
+            pulsesChanged = false;
+        }
         display.clearDisplay();
         display.setCursor(0, 0);
         display.setTextWrap(false);
         // Four 8-pixel rows per page on the 128x32 OLED.
-        if ((lastDisplay / 3000) % 2 == 0) {
+        if (((lastDisplay - displayCycleStart) / pageDurationMs) % 2 == 0) {
             display.printf("BLE %s Bat ", connected.load() ? "ON" : "OFF");
             if (!config::BatteryEnabled) display.println("OFF");
             else if (!batteryValid) display.println("--");

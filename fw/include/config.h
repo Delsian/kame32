@@ -33,8 +33,8 @@ constexpr bool isServoChannel(unsigned channel) {
         if (channel == configured) return true;
     return false;
 }
-constexpr uint16_t MinPulseUs = 1000;
-constexpr uint16_t MaxPulseUs = 2000;
+constexpr uint16_t MinPulseUs = 500;
+constexpr uint16_t MaxPulseUs = 2500;
 constexpr uint16_t PwmHz = 50;
 constexpr uint32_t TimeoutMs = 2000;
 constexpr char DeviceName[] = "Kame32";
@@ -42,5 +42,6 @@ constexpr char ServiceUuid[] = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 constexpr char RxUuid[] = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
 constexpr char TxUuid[] = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
 constexpr char PoseUuid[] = "6e400004-b5a3-f393-e0a9-e50e24dcca9e";
+constexpr char WifiUuid[] = "6e400006-b5a3-f393-e0a9-e50e24dcca9e";
 constexpr char OtaUuid[] = "6e400005-b5a3-f393-e0a9-e50e24dcca9e";
 }
