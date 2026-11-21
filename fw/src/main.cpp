@@ -62,6 +62,41 @@ bool batteryValid = false;
 NimBLECharacteristic *tx;
 bool pcaReady = false, displayReady = false, active = false;
 uint16_t pulses[16] = {};
+struct PulseLimits {
+    uint16_t minimum = config::MinPulseUs;
+    uint16_t maximum = config::MaxPulseUs;
+    bool allows(unsigned pulse) const { return pulse >= minimum && pulse <= maximum; }
+};
+struct ServoLimits {
+    PulseLimits channel[16];
+};
+constexpr char LimitsKey[] = "limits-v1";
+ServoLimits servoLimits{};
+Preferences servoPreferences;
+bool canSaveLimits = false;
+QueueHandle_t limitsRequests;
+
+bool validLimits(unsigned minimum, unsigned maximum) {
+    return minimum >= config::MinPulseUs && minimum <= maximum && maximum <= config::MaxPulseUs;
+}
+
+void loadServoLimits() {
+    canSaveLimits = servoPreferences.begin("servo", false);
+    ServoLimits saved{};
+    if (!canSaveLimits || servoPreferences.getBytesLength(LimitsKey) != sizeof(saved) ||
+        servoPreferences.getBytes(LimitsKey, &saved, sizeof(saved)) != sizeof(saved)) return;
+    for (const auto &servo : config::ServoLocations) {
+        const auto &limit = saved.channel[servo.channel];
+        if (!validLimits(limit.minimum, limit.maximum)) return;
+    }
+    servoLimits = saved;
+}
+
+struct LimitsRequest {
+    ServoLimits limits;
+    TaskHandle_t requester;
+};
+
 bool pulsesChanged = false;
 uint32_t lastCommand = 0;
 bool startupLedPending = false;
@@ -81,6 +116,27 @@ void stopOutputs() {
     pulsesChanged |= active;
     memset(pulses, 0, sizeof(pulses));
     active = false;
+}
+
+void processLimitsRequest() {
+    LimitsRequest request;
+    if (!limitsRequests || xQueueReceive(limitsRequests, &request, 0) != pdTRUE) return;
+    uint32_t status = 503;
+    if (!otaPartition && canSaveLimits) {
+        status = 500;
+        if (servoPreferences.putBytes(LimitsKey, &request.limits, sizeof(ServoLimits)) == sizeof(ServoLimits)) {
+            servoLimits = request.limits;
+            for (const auto &servo : config::ServoLocations) {
+                const uint8_t channel = servo.channel;
+                if (pulses[channel] && !servoLimits.channel[channel].allows(pulses[channel])) {
+                    stopOutputs();
+                    break;
+                }
+            }
+            status = 200;
+        }
+    }
+    xTaskNotify(request.requester, status, eSetValueWithOverwrite);
 }
 
 void reply(const char *message) {
@@ -290,9 +346,11 @@ void processPose(const uint8_t *pose) {
     if (!pcaReady) { reply("ERR PCA9685 missing"); return; }
     for (uint8_t i = 0; i < config::ServoCount; ++i) {
         const uint8_t position = pose[i] == 0 ? 0 : pose[i] - 1;
-        const uint16_t pulse = config::MinPulseUs +
+        const uint16_t requested = config::MinPulseUs +
             (position * (config::MaxPulseUs - config::MinPulseUs) + 127U) / 254U;
-        const uint8_t channel = config::ServoChannels[i];
+        const uint8_t channel = config::ServoLocations[i].channel;
+        const auto &limit = servoLimits.channel[channel];
+        const uint16_t pulse = constrain(requested, limit.minimum, limit.maximum);
         if (pulses[channel] != pulse && !writeServo(channel, pulse)) return;
     }
     enableOutputs();
@@ -329,6 +387,7 @@ void processCommand(const char *text) {
     } else if (sscanf(text, "SET %3u %4u %c", &channel, &pulse, &extra) == 2 &&
                config::isServoChannel(channel) && pulse >= config::MinPulseUs &&
                pulse <= config::MaxPulseUs) {
+        if (!servoLimits.channel[channel].allows(pulse)) { reply("ERR servo limits"); return; }
         if (!pcaReady) { reply("ERR PCA9685 missing"); return; }
         if (writeServo(channel, pulse)) {
             enableOutputs();
@@ -411,7 +470,64 @@ class WifiCallbacks : public NimBLECharacteristicCallbacks {
     }
 };
 
+String renderServoPage(const ServoLimits &limits, bool calibration) {
+    String page(ServoPageHead);
+    page += calibration ? LimitsPageStart : ServoPageStart;
+    constexpr struct {
+        const char *name;
+        config::ServoLocation servos[2];
+    } legs[] = {
+        {"Left front", {config::LFC, config::LFF}},
+        {"Right front", {config::RFC, config::RFF}},
+        {"Left back", {config::LBC, config::LBF}},
+        {"Right back", {config::RBC, config::RBF}},
+    };
+    for (const auto &leg : legs) {
+        page += "<fieldset><legend>";
+        page += leg.name;
+        page += "</legend>";
+        for (const auto &servo : leg.servos) {
+            const auto &limit = limits.channel[servo.channel];
+            char controls[360];
+            if (calibration) {
+                snprintf(controls, sizeof(controls),
+                         "<div>%s</div><div class=bounds>"
+                         "<label>Min<input type=number name=%s-min aria-label='%s minimum pulse width' "
+                         "min=%u max=%u value=%u required></label>"
+                         "<label>Max<input type=number name=%s-max aria-label='%s maximum pulse width' "
+                         "min=%u max=%u value=%u required></label></div>",
+                         servo.name, servo.name, servo.name, config::MinPulseUs, config::MaxPulseUs,
+                         limit.minimum, servo.name, servo.name, config::MinPulseUs, config::MaxPulseUs,
+                         limit.maximum);
+            } else {
+                const unsigned center = (limit.minimum + limit.maximum) / 2;
+                snprintf(controls, sizeof(controls),
+                         "<label>%s <output>%u µs</output>"
+                         "<input type=range aria-label='%s pulse width' data-channel=%u data-location=%s "
+                         "min=%u max=%u value=%u></label>",
+                         servo.name, center, servo.name, static_cast<unsigned>(servo.channel), servo.name,
+                         limit.minimum, limit.maximum, center);
+            }
+            page += controls;
+        }
+        page += "</fieldset>";
+    }
+    page += calibration ? LimitsPageEnd : ServoPageEnd;
+    return page;
+}
+
+unsigned limitField(const String &value) {
+    if (value.isEmpty() || value.length() > 4) return 0;
+    unsigned pulse = 0;
+    for (char digit : value) {
+        if (digit < '0' || digit > '9') return 0;
+        pulse = pulse * 10 + digit - '0';
+    }
+    return pulse;
+}
+
 void serveWifi(void *) {
+    ServoLimits webLimits = servoLimits;
     Preferences preferences;
     const bool canSave = preferences.begin("wifi-sta", false);
     WifiSettings saved{};
@@ -421,21 +537,14 @@ void serveWifi(void *) {
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
     if (configured) WiFi.begin(saved.ssid, saved.password);
-    String page(ServoPageStart);
-    const unsigned center = (config::MinPulseUs + config::MaxPulseUs) / 2;
-    for (const unsigned channel : config::ServoChannels) {
-        char slider[256];
-        snprintf(slider, sizeof(slider),
-                 "<label>Channel %u <output>%u µs</output>"
-                 "<input type=range aria-label='Channel %u pulse width' data-channel=%u "
-                 "min=%u max=%u value=%u></label>",
-                 channel, center, channel, channel, config::MinPulseUs, config::MaxPulseUs, center);
-        page += slider;
-    }
-    page += ServoPageEnd;
 
     WebServer server(80);
-    server.on("/", HTTP_GET, [&] { server.send(200, "text/html; charset=utf-8", page); });
+    const auto servePage = [&](bool calibration) {
+        server.sendHeader("Cache-Control", "no-store");
+        server.send(200, "text/html; charset=utf-8", renderServoPage(webLimits, calibration));
+    };
+    server.on("/", HTTP_GET, [&] { servePage(false); });
+    server.on("/limits", HTTP_GET, [&] { servePage(true); });
     const auto submit = [&](WebCommand command) {
         if (server.header("X-Kame32-Control") != "1") {
             server.send(403);
@@ -449,12 +558,44 @@ void serveWifi(void *) {
     };
     const char *headers[] = {"X-Kame32-Control"};
     server.collectHeaders(headers, 1);
+    server.on("/limits", HTTP_POST, [&] {
+        if (server.header("X-Kame32-Control") != "1") {
+            server.send(403, "text/plain", "Request rejected.");
+            return;
+        }
+        LimitsRequest request{webLimits, xTaskGetCurrentTaskHandle()};
+        for (const auto &servo : config::ServoLocations) {
+            const unsigned minimum = limitField(server.arg(String(servo.name) + "-min"));
+            const unsigned maximum = limitField(server.arg(String(servo.name) + "-max"));
+            if (!validLimits(minimum, maximum)) {
+                server.send(400, "text/plain", String(servo.name) +
+                            ": enter 500–2500 µs with minimum at or below maximum.");
+                return;
+            }
+            request.limits.channel[servo.channel] = {
+                static_cast<uint16_t>(minimum), static_cast<uint16_t>(maximum),
+            };
+        }
+        if (!limitsRequests || xQueueSend(limitsRequests, &request, 0) != pdTRUE) {
+            server.send(503, "text/plain", "Limits could not be saved. Try again.");
+            return;
+        }
+        // The control loop commits the limits and checks the active outputs before acknowledging.
+        uint32_t status;
+        xTaskNotifyWait(0, UINT32_MAX, &status, portMAX_DELAY);
+        if (status == 200) {
+            webLimits = request.limits;
+            server.send(200, "text/plain", "Servo limits saved.");
+        } else {
+            server.send(status, "text/plain", "Limits could not be saved. Try again.");
+        }
+    });
     server.on("/servo", HTTP_POST, [&] {
         const String body = server.arg("plain");
         unsigned channel, pulse;
         char extra;
         if (sscanf(body.c_str(), "%3u %4u %c", &channel, &pulse, &extra) != 2 ||
-            !config::isServoChannel(channel) || pulse < config::MinPulseUs || pulse > config::MaxPulseUs) {
+            !config::isServoChannel(channel) || !webLimits.channel[channel].allows(pulse)) {
             server.send(400);
             return;
         }
@@ -518,6 +659,7 @@ void setup() {
     pinMode(config::BootButton, INPUT_PULLUP);
     startupLed(0, 0, config::StartupLedBrightness);
     Serial.begin(115200);
+    loadServoLimits();
     if (config::BatteryEnabled) {
         pinMode(config::BatteryPin, INPUT);
         analogReadResolution(12);
@@ -592,6 +734,7 @@ void setup() {
         startupLedPending = true;
     }
     webCommands = xQueueCreate(8, sizeof(WebCommand));
+    limitsRequests = xQueueCreate(1, sizeof(LimitsRequest));
     webControlAvailable = pcaReady;
     if (!webCommands || !wifiRequests || xTaskCreate(serveWifi, "servo-wifi", 8192, nullptr, 1, nullptr) != pdPASS) {
         Serial.println("ERR Wi-Fi worker");
@@ -604,6 +747,7 @@ void loop() {
         delay(5);
         return;
     }
+    processLimitsRequest();
     if (startupLedPending && millis() - startupLedSince >= config::StartupLedHoldMs) {
         startupLed(0, 0, 0);
         startupLedPending = false;
@@ -643,7 +787,8 @@ void loop() {
     if (webCommands && !stopRequested.load() && xQueueReceive(webCommands, &webCommand, 0) == pdTRUE) {
         switch (webCommand.action) {
             case WebAction::Set:
-                if (pcaReady && writeServo(webCommand.channel, webCommand.pulse)) enableOutputs(true);
+                if (pcaReady && servoLimits.channel[webCommand.channel].allows(webCommand.pulse) &&
+                    writeServo(webCommand.channel, webCommand.pulse)) enableOutputs(true);
                 break;
             case WebAction::Stop:
                 stopOutputs();
@@ -685,9 +830,10 @@ void loop() {
             display.printf("%.21s", lastStatus);
         } else {
             for (uint8_t i = 0; i < config::ServoCount; i += 2) {
-                const uint8_t first = config::ServoChannels[i];
-                const uint8_t second = config::ServoChannels[i + 1];
-                display.printf("%2u:%4u  %2u:%4u\n", first, pulses[first], second, pulses[second]);
+                const auto &first = config::ServoLocations[i];
+                const auto &second = config::ServoLocations[i + 1];
+                display.printf("%s:%4u  %s:%4u\n", first.name, pulses[first.channel],
+                               second.name, pulses[second.channel]);
             }
         }
         display.display();

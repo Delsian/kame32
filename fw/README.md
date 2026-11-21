@@ -2,6 +2,13 @@
 
 Standalone PlatformIO Arduino project for a Waveshare ESP32-C6-Zero, eight servos
 on PCA9685 channels 0–4 and 12–14, BLE control, a shared I2C display, and a VL53L0X distance sensor.
+
+| Leg | Coxa | Femur |
+| --- | --- | --- |
+| Right front | RFC (0) | RFF (13) |
+| Left front | LFC (1) | LFF (4) |
+| Right back | RBC (12) | RBF (14) |
+| Left back | LBC (2) | LBF (3) |
 The old `../code` project is independent.
 
 Open `kame32.code-workspace` in VS Code. It reuses the editor preferences and
@@ -24,7 +31,7 @@ Pins, addresses, servo limits and timeout are in
 `include/config.h`. Wiring is in [doc/schematic.md](doc/schematic.md).
 
 Build with `pio run -e waveshare-esp32-c6-zero-pwm-debug` to start PWM at
-1500 µs on all eight channels and hold the current pose through BLE idle and
+1500 µs on all eight channels, clamped to each servo's saved limits, and hold the current pose through BLE idle and
 disconnect. STOP, including the Android app's initial STOP on connection,
 releases the outputs until a new pose or SET command. Firmware updates and
 receive faults also release the outputs.
@@ -41,6 +48,12 @@ Once the ESP32 joins, the app shows its local address and enables **Open servo
 web page**. Use **Check Wi-Fi status** after reconnecting over BLE. The page
 has eight sliders and a STOP button. Use it on a trusted local network, where
 devices that can reach the ESP32 can use the servo controls.
+
+Open **Servo limits** on the web page to set each servo's minimum and maximum
+pulse width. Select **Save limits** to apply them and store them in nonvolatile
+flash across reboots. Each pair must satisfy 500 µs ≤ minimum ≤ maximum ≤
+2500 µs. The control sliders use the saved bounds. If a new limit excludes a
+currently applied pulse, saving releases all servo outputs.
 
 Keep the page visible to hold the outputs with the standard firmware. They
 release after two seconds without a keepalive. The PWM debug profile holds
@@ -112,9 +125,10 @@ Advertised name: `Kame32`. Nordic UART-style UUIDs:
 
 Write exactly eight raw bytes to Pose in channel order **0, 1, 2, 3, 4, 12,
 13, 14**. Eight zero bytes disable all outputs and report `OK STOP` on TX.
-For any other frame, each byte selects a position across the configured pulse
+For any other frame, each byte selects a position across the 500–2500 µs pulse
 range. Byte values 0 and 1 both select the minimum, 128 selects the midpoint,
 and 255 selects the maximum. Values 1–255 are spaced evenly across the range.
+The firmware clamps each resulting pulse to that servo's saved limits.
 A successful pose reports `OK POSE` on TX. Resend the pose within two seconds
 to maintain PWM output.
 
@@ -133,7 +147,8 @@ any nearby client can connect and command the servos. No Bluetooth Classic/SPP.
 | `BATTERY` | Read cached voltage: `OK BATTERY <n> mV`; ERR if disabled or unavailable; does not refresh servo timeout |
 | `STOP` | Disable all outputs immediately when processed |
 
-Commands use physical PCA9685 channels 0–4 and 12–14; accepted pulse widths are 500–2500 µs at 50 Hz. Calibrate
+Commands use physical PCA9685 channels 0–4 and 12–14 with PWM at 50 Hz.
+`SET` rejects pulse widths outside the selected servo's saved limits. Calibrate
 limits to the servos/linkage before expanding them. Send Pose, SET or PING more
 often than every two seconds while holding a pose. Boot, disconnect, timeout,
 queue overflow and malformed BLE frames disable outputs. Invalid text commands

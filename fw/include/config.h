@@ -26,11 +26,28 @@ constexpr uint8_t BatterySamples = 8;
 constexpr uint32_t BatteryAdcLimitMv = 2400; // conservative measurement ceiling
 static_assert(BatteryTopOhms > 0 && BatteryBottomOhms > 0 && BatterySamples > 0);
 static_assert(BatteryCalibration > 0 && BatterySampleMs > 0);
-constexpr uint8_t ServoChannels[] = {0, 1, 2, 3, 4, 12, 13, 14};
-constexpr uint8_t ServoCount = sizeof(ServoChannels) / sizeof(ServoChannels[0]);
+struct ServoLocation {
+    uint8_t channel;
+    const char *name;
+};
+
+constexpr ServoLocation RFC{0, "RFC"};
+constexpr ServoLocation RFF{13, "RFF"};
+constexpr ServoLocation LFC{1, "LFC"};
+constexpr ServoLocation LFF{4, "LFF"};
+constexpr ServoLocation RBC{12, "RBC"};
+constexpr ServoLocation RBF{14, "RBF"};
+constexpr ServoLocation LBC{2, "LBC"};
+constexpr ServoLocation LBF{3, "LBF"};
+
+// Keep this order for the BLE Pose characteristic.
+constexpr ServoLocation ServoLocations[] = {
+    RFC, LFC, LBC, LBF, LFF, RBC, RFF, RBF,
+};
+constexpr uint8_t ServoCount = sizeof(ServoLocations) / sizeof(ServoLocations[0]);
 constexpr bool isServoChannel(unsigned channel) {
-    for (uint8_t configured : ServoChannels)
-        if (channel == configured) return true;
+    for (const auto &servo : ServoLocations)
+        if (channel == servo.channel) return true;
     return false;
 }
 constexpr uint16_t MinPulseUs = 500;
